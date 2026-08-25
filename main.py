@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from chunking import create_chunks
 from embeddings import create_embedding
 from search import find_similar_chunks
-from storage import load_documents, save_documents, get_document
+from database import get_connection
 
 
 load_dotenv()
@@ -50,10 +50,16 @@ async def upload_document(file: UploadFile = File(...)):
 
     contents = await file.read()
 
-    document = fitz.open(
-        stream=contents,
-        filetype="pdf"
-    )
+    try:
+        document = fitz.open(
+            stream=contents,
+            filetype="pdf"
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid PDF file"
+        )
 
     document_text = ""
 
@@ -68,47 +74,80 @@ async def upload_document(file: UploadFile = File(...)):
             detail="PDF does not contain text"
         )
 
-    # Разбиваем документ на chunks
+    # --------------------------------------------------
+    # CHUNKING
+    # --------------------------------------------------
+
     chunks = create_chunks(document_text)
 
-    # Уникальный ID документа
     document_id = str(uuid.uuid4())
 
-    document_chunks = []
+    connection = get_connection()
 
-    # Создаём embedding для каждого chunk
-    for chunk in chunks:
+    try:
+        cursor = connection.cursor()
 
-        embedding = create_embedding(
-            client,
-            chunk
+        # --------------------------------------------------
+        # SAVE DOCUMENT
+        # --------------------------------------------------
+
+        cursor.execute(
+            """
+            INSERT INTO documents (id, filename)
+            VALUES (%s, %s)
+            """,
+            (
+                document_id,
+                file.filename
+            )
         )
 
-        document_chunks.append({
-            "text": chunk,
-            "embedding": embedding
-        })
+        # --------------------------------------------------
+        # CREATE EMBEDDINGS + SAVE CHUNKS
+        # --------------------------------------------------
 
-    # Формируем документ
-    new_document = {
-        "id": document_id,
-        "filename": file.filename,
-        "chunks": document_chunks
-    }
+        for chunk in chunks:
 
-    # Загружаем существующие документы
-    documents = load_documents()
+            embedding = create_embedding(
+                client,
+                chunk
+            )
 
-    # Добавляем новый
-    documents.append(new_document)
+            embedding_string = "[" + ",".join(
+                str(value)
+                for value in embedding
+            ) + "]"
 
-    # Сохраняем
-    save_documents(documents)
+            cursor.execute(
+                """
+                INSERT INTO chunks (
+                    document_id,
+                    content,
+                    embedding
+                )
+                VALUES (%s, %s, %s::vector)
+                """,
+                (
+                    document_id,
+                    chunk,
+                    embedding_string
+                )
+            )
+
+        connection.commit()
+
+    except Exception:
+        connection.rollback()
+        raise
+
+    finally:
+        cursor.close()
+        connection.close()
 
     return {
         "id": document_id,
         "filename": file.filename,
-        "chunks_count": len(document_chunks)
+        "chunks_count": len(chunks)
     }
 
 
@@ -119,16 +158,44 @@ async def upload_document(file: UploadFile = File(...)):
 @app.get("/documents")
 def get_documents():
 
-    documents = load_documents()
+    connection = get_connection()
 
-    return [
-        {
-            "id": document["id"],
-            "filename": document["filename"],
-            "chunks_count": len(document["chunks"])
-        }
-        for document in documents
-    ]
+    try:
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                d.id,
+                d.filename,
+                d.created_at,
+                COUNT(c.id) AS chunks_count
+            FROM documents d
+            LEFT JOIN chunks c
+                ON c.document_id = d.id
+            GROUP BY
+                d.id,
+                d.filename,
+                d.created_at
+            ORDER BY d.created_at DESC
+            """
+        )
+
+        rows = cursor.fetchall()
+
+        return [
+            {
+                "id": row[0],
+                "filename": row[1],
+                "created_at": row[2],
+                "chunks_count": row[3]
+            }
+            for row in rows
+        ]
+
+    finally:
+        cursor.close()
+        connection.close()
 
 
 # --------------------------------------------------
@@ -140,13 +207,20 @@ def ask_question(
     document_id: str,
     data: Question
 ):
-    # 1. Превращаем вопрос в embedding
+
+    # --------------------------------------------------
+    # 1. EMBEDDING QUESTION
+    # --------------------------------------------------
+
     question_embedding = create_embedding(
         client,
         data.question
     )
 
-    # 2. Ищем похожие chunks непосредственно в PostgreSQL
+    # --------------------------------------------------
+    # 2. VECTOR SEARCH
+    # --------------------------------------------------
+
     similar_chunks = find_similar_chunks(
         document_id,
         question_embedding,
@@ -154,23 +228,31 @@ def ask_question(
     )
 
     if not similar_chunks:
-        return {
-            "error": "Document not found or has no chunks"
-        }
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found or has no chunks"
+        )
 
-    # 3. Собираем контекст
+    # --------------------------------------------------
+    # 3. CONTEXT
+    # --------------------------------------------------
+
     context = "\n\n".join(
         chunk["text"]
         for chunk in similar_chunks
     )
 
-    # 4. Отправляем контекст + вопрос Gemini
+    # --------------------------------------------------
+    # 4. ASK GEMINI
+    # --------------------------------------------------
+
     prompt = f"""
 Ты отвечаешь на вопросы по документу.
 
 Используй только информацию из предоставленного контекста.
 
 Если ответа в контексте нет, скажи:
+
 "В документе нет информации по этому вопросу."
 
 Контекст документа:
@@ -191,4 +273,27 @@ def ask_question(
         "document_id": document_id,
         "question": data.question,
         "answer": response.text
+    }
+
+@app.post("/documents/{document_id}/search")
+def search_document(
+    document_id: str,
+    data: Question
+):
+    # Создаём embedding вопроса
+    question_embedding = create_embedding(
+        client,
+        data.question
+    )
+
+    # Ищем похожие chunks в PostgreSQL
+    similar_chunks = find_similar_chunks(
+        document_id,
+        question_embedding,
+        top_k=3
+    )
+
+    return {
+        "question": data.question,
+        "results": similar_chunks
     }

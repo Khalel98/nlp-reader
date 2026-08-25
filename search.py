@@ -6,13 +6,15 @@ def find_similar_chunks(
     question_embedding,
     top_k=3
 ):
-    connection = get_connection()
+    conn = get_connection()
 
     try:
-        with connection.cursor() as cursor:
+        with conn.cursor() as cursor:
+
             cursor.execute(
                 """
                 SELECT
+                    id,
                     content,
                     1 - (embedding <=> %s::vector) AS similarity
                 FROM chunks
@@ -32,11 +34,12 @@ def find_similar_chunks(
 
             return [
                 {
-                    "text": row[0],
-                    "similarity": float(row[1])
+                    "id": row[0],
+                    "text": row[1],
+                    "similarity": float(row[2])
                 }
                 for row in rows
             ]
 
     finally:
-        connection.close()
+        conn.close()

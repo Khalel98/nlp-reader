@@ -4,7 +4,10 @@ from google import genai
 def create_embedding(client, text):
     response = client.models.embed_content(
         model="gemini-embedding-001",
-        contents=text
+        contents=text,
+        config={
+            "output_dimensionality": 768
+        }
     )
 
     return response.embeddings[0].values
