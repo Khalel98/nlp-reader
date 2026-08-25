@@ -6,6 +6,9 @@ from google import genai
 from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
 
+from chunking import create_chunks
+from embeddings import create_embedding
+from search import find_similar_chunks
 
 load_dotenv()
 
@@ -18,7 +21,7 @@ client = genai.Client(
 )
 
 
-document_text = ""
+document_chunks = []
 
 
 class Question(BaseModel):
@@ -34,7 +37,7 @@ def root():
 
 @app.post("/upload")
 async def upload_document(file: UploadFile = File(...)):
-    global document_text
+    global document_chunks
 
     contents = await file.read()
 
@@ -50,29 +53,64 @@ async def upload_document(file: UploadFile = File(...)):
 
     document.close()
 
+    chunks = create_chunks(document_text)
+
+    document_chunks = []
+
+    for chunk in chunks:
+        embedding = create_embedding(
+            client,
+            chunk
+        )
+
+        document_chunks.append({
+            "text": chunk,
+            "embedding": embedding
+        })
+
     return {
         "filename": file.filename,
-        "message": "Document uploaded successfully"
+        "chunks_count": len(document_chunks)
     }
 
 
 @app.post("/ask")
 def ask_question(data: Question):
-    if not document_text:
+    if not document_chunks:
         return {
             "error": "Please upload a document first"
         }
 
+    # 1. Создаём embedding вопроса
+    question_embedding = create_embedding(
+        client,
+        data.question
+    )
+
+    # 2. Ищем самые подходящие куски документа
+    similar_chunks = find_similar_chunks(
+        question_embedding,
+        document_chunks,
+        top_k=3
+    )
+
+    # 3. Собираем найденные куски в один текст
+    context = "\n\n".join(
+        chunk["text"]
+        for chunk in similar_chunks
+    )
+
+    # 4. Отправляем вопрос + найденный контекст Gemini
     prompt = f"""
 Ты отвечаешь на вопросы по документу.
 
-Используй только информацию из документа.
+Используй только информацию из предоставленного контекста.
 
-Если ответа в документе нет, скажи:
+Если ответа в контексте нет, скажи:
 "В документе нет информации по этому вопросу."
 
-Документ:
-{document_text}
+Контекст документа:
+{context}
 
 Вопрос:
 {data.question}
@@ -84,5 +122,6 @@ def ask_question(data: Question):
     )
 
     return {
+        "question": data.question,
         "answer": response.text
     }
