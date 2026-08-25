@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: document-ai-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: document_ai
+
+    ports:
+      - "5435:5432"
+
+    volumes:
+      - document_ai_postgres_data:/var/lib/postgresql/data
+
+volumes:
+  document_ai_postgres_data:

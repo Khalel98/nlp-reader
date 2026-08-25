@@ -1,38 +1,42 @@
-import numpy as np
-
-
-def cosine_similarity(vector_a, vector_b):
-    vector_a = np.array(vector_a)
-    vector_b = np.array(vector_b)
-
-    similarity = np.dot(vector_a, vector_b) / (
-        np.linalg.norm(vector_a) * np.linalg.norm(vector_b)
-    )
-
-    return similarity
+from database import get_connection
 
 
 def find_similar_chunks(
+    document_id,
     question_embedding,
-    document_chunks,
     top_k=3
 ):
-    results = []
+    connection = get_connection()
 
-    for chunk in document_chunks:
-        similarity = cosine_similarity(
-            question_embedding,
-            chunk["embedding"]
-        )
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    content,
+                    1 - (embedding <=> %s::vector) AS similarity
+                FROM chunks
+                WHERE document_id = %s
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+                """,
+                (
+                    question_embedding,
+                    document_id,
+                    question_embedding,
+                    top_k
+                )
+            )
 
-        results.append({
-            "text": chunk["text"],
-            "similarity": similarity
-        })
+            rows = cursor.fetchall()
 
-    results.sort(
-        key=lambda x: x["similarity"],
-        reverse=True
-    )
+            return [
+                {
+                    "text": row[0],
+                    "similarity": float(row[1])
+                }
+                for row in rows
+            ]
 
-    return results[:top_k]
+    finally:
+        connection.close()
